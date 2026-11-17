@@ -180,6 +180,7 @@ typedef struct tagBITMAPINFOHEADER {
 #include <stdlib.h>                     // Required for: malloc(), free()
 #include <stdio.h>                      // Required for: FILE, fopen(), fclose(), fread()
 #include <string.h>                     // Required for: strcmp() [Used in IsFileExtension(), LoadWaveFromMemory(), LoadMusicStreamFromMemory()]
+#include <limits.h>                     // Required for: UINT_MAX
 
 #if defined(RAUDIO_STANDALONE)
     #ifndef TRACELOG
@@ -339,7 +340,8 @@ typedef enum {
 // depending on whether data is streamed (Music vs Sound)
 typedef enum {
     AUDIO_BUFFER_USAGE_STATIC = 0,
-    AUDIO_BUFFER_USAGE_STREAM
+    AUDIO_BUFFER_USAGE_STREAM,
+    AUDIO_BUFFER_USAGE_RING
 } AudioBufferUsage;
 
 // Audio buffer struct
@@ -364,6 +366,13 @@ struct rAudioBuffer {
     unsigned int sizeInFrames;      // Total buffer size in frames
     unsigned int frameCursorPos;    // Frame cursor position
     unsigned int framesProcessed;   // Total frames processed in this buffer (required for play timing)
+
+    bool isRingBuffer;              // Ring buffer mode, does not use the virtual double buffer
+    unsigned int writeCursorPos;    // Ring buffer write cursor position
+    unsigned int framesAvailable;   // Ring buffer frames available for reading
+    bool underrun;                  // Ring buffer is currently starved
+    unsigned int underrunCount;     // Number of contiguous underrun events
+    size_t converterHeapSize;       // Memory owned by the data converter
 
     unsigned char *data;            // Data buffer, on music stream keeps filling
 
@@ -420,6 +429,8 @@ static void OnLog(void *pUserData, ma_uint32 level, const char *pMessage);
 // Reads audio data from an AudioBuffer object in internal/device formats
 static ma_uint32 ReadAudioBufferFramesInInternalFormat(AudioBuffer *audioBuffer, void *framesOut, ma_uint32 frameCount);
 static ma_uint32 ReadAudioBufferFramesInMixingFormat(AudioBuffer *audioBuffer, float *framesOut, ma_uint32 frameCount);
+static ma_uint32 ReadAudioRingBufferFrames(AudioBuffer *audioBuffer, void *framesOut, ma_uint32 frameCount);
+static ma_uint32 WriteAudioRingBufferFrames(AudioBuffer *audioBuffer, const void *framesIn, ma_uint32 frameCount);
 
 static void OnSendAudioDataToDevice(ma_device *pDevice, void *pFramesOut, const void *pFramesInput, ma_uint32 frameCount);
 static void MixAudioFrames(float *framesOut, const float *framesIn, ma_uint32 frameCount, AudioBuffer *buffer);
@@ -427,6 +438,8 @@ static void MixAudioFrames(float *framesOut, const float *framesIn, ma_uint32 fr
 static bool IsAudioBufferPlayingInLockedState(AudioBuffer *buffer);
 static void StopAudioBufferInLockedState(AudioBuffer *buffer);
 static void UpdateAudioStreamInLockedState(AudioStream stream, const void *data, int frameCount);
+static AudioStreamStatus WriteAudioStreamInLockedState(AudioStream stream, const void *data, int frameCount, int *framesWritten);
+static AudioStreamStatus ReadAudioStreamInLockedState(AudioStream stream, void *data, int frameCount, int *framesRead);
 
 #if defined(RAUDIO_STANDALONE)
 static bool IsFileExtension(const char *fileName, const char *ext); // Check file extension
@@ -544,6 +557,15 @@ void CloseAudioDevice(void)
         AUDIO.System.pcmBuffer = NULL;
         AUDIO.System.pcmBufferSize = 0;
 
+        rAudioProcessor *processor = AUDIO.mixedProcessor;
+        while (processor != NULL)
+        {
+            rAudioProcessor *next = processor->next;
+            RL_FREE(processor);
+            processor = next;
+        }
+        AUDIO.mixedProcessor = NULL;
+
         TRACELOG(LOG_INFO, "AUDIO: Device closed successfully");
     }
     else TRACELOG(LOG_WARNING, "AUDIO: Device could not be closed, not currently initialized");
@@ -578,17 +600,37 @@ AudioBuffer *LoadAudioBuffer(ma_format format, ma_uint32 channels, ma_uint32 sam
 {
     AudioBuffer *audioBuffer = (AudioBuffer *)RL_CALLOC(1, sizeof(AudioBuffer));
 
-    if (sizeInFrames > 0) audioBuffer->data = (unsigned char *)RL_CALLOC(sizeInFrames*channels*ma_get_bytes_per_sample(format), 1);
+    if (audioBuffer == NULL) return NULL;
+
+    if (sizeInFrames > 0)
+    {
+        audioBuffer->data = (unsigned char *)RL_CALLOC(sizeInFrames*channels*ma_get_bytes_per_sample(format), 1);
+
+        if (audioBuffer->data == NULL)
+        {
+            RL_FREE(audioBuffer);
+            return NULL;
+        }
+    }
 
     // Audio data runs through a format converter
-    ma_data_converter_config converterConfig = ma_data_converter_config_init(format, AUDIO_DEVICE_FORMAT, channels, AUDIO_DEVICE_CHANNELS, sampleRate, AUDIO.System.device.sampleRate);
+    ma_uint32 outputSampleRate = (AUDIO.System.device.sampleRate > 0)? AUDIO.System.device.sampleRate : sampleRate;
+    ma_data_converter_config converterConfig = ma_data_converter_config_init(format, AUDIO_DEVICE_FORMAT, channels, AUDIO_DEVICE_CHANNELS, sampleRate, outputSampleRate);
     converterConfig.allowDynamicSampleRate = true;
+
+    if (ma_data_converter_get_heap_size(&converterConfig, &audioBuffer->converterHeapSize) != MA_SUCCESS)
+    {
+        RL_FREE(audioBuffer->data);
+        RL_FREE(audioBuffer);
+        return NULL;
+    }
 
     ma_result result = ma_data_converter_init(&converterConfig, NULL, &audioBuffer->converter);
 
     if (result != MA_SUCCESS)
     {
         TRACELOG(LOG_WARNING, "AUDIO: Failed to create data conversion pipeline");
+        RL_FREE(audioBuffer->data);
         RL_FREE(audioBuffer);
         return NULL;
     }
@@ -601,6 +643,14 @@ AudioBuffer *LoadAudioBuffer(ma_format format, ma_uint32 channels, ma_uint32 sam
     // required. This will be kept relatively small to avoid too much wastage
     audioBuffer->converterResidualCount = 0;
     audioBuffer->converterResidual = (unsigned char*)RL_CALLOC(AUDIO_BUFFER_RESIDUAL_CAPACITY*ma_get_bytes_per_frame(format, channels), 1);
+
+    if (audioBuffer->converterResidual == NULL)
+    {
+        ma_data_converter_uninit(&audioBuffer->converter, NULL);
+        RL_FREE(audioBuffer->data);
+        RL_FREE(audioBuffer);
+        return NULL;
+    }
 
     // Init audio buffer values
     audioBuffer->volume = 1.0f;
@@ -615,9 +665,14 @@ AudioBuffer *LoadAudioBuffer(ma_format format, ma_uint32 channels, ma_uint32 sam
     audioBuffer->looping = false;
 
     audioBuffer->usage = usage;
+    audioBuffer->isRingBuffer = (usage == AUDIO_BUFFER_USAGE_RING);
     audioBuffer->frameCursorPos = 0;
     audioBuffer->framesProcessed = 0;
     audioBuffer->sizeInFrames = sizeInFrames;
+    audioBuffer->writeCursorPos = 0;
+    audioBuffer->framesAvailable = 0;
+    audioBuffer->underrun = false;
+    audioBuffer->underrunCount = 0;
 
     // Buffers should be marked as processed by default so that a call to
     // UpdateAudioStream() immediately after initialization works correctly
@@ -636,6 +691,15 @@ void UnloadAudioBuffer(AudioBuffer *buffer)
     if (buffer != NULL)
     {
         UntrackAudioBuffer(buffer);
+
+        rAudioProcessor *processor = buffer->processor;
+        while (processor != NULL)
+        {
+            rAudioProcessor *next = processor->next;
+            RL_FREE(processor);
+            processor = next;
+        }
+
         ma_data_converter_uninit(&buffer->converter, NULL);
         RL_FREE(buffer->converterResidual);
         RL_FREE(buffer->data);
@@ -663,10 +727,15 @@ void PlayAudioBuffer(AudioBuffer *buffer)
         ma_mutex_lock(&AUDIO.System.lock);
         buffer->playing = true;
         buffer->paused = false;
-        buffer->frameCursorPos = 0;
-        buffer->framesProcessed = 0;
-        buffer->isSubBufferProcessed[0] = true;
-        buffer->isSubBufferProcessed[1] = true;
+
+        if (!buffer->isRingBuffer)
+        {
+            buffer->frameCursorPos = 0;
+            buffer->framesProcessed = 0;
+            buffer->isSubBufferProcessed[0] = true;
+            buffer->isSubBufferProcessed[1] = true;
+        }
+
         ma_mutex_unlock(&AUDIO.System.lock);
     }
 }
@@ -2136,6 +2205,43 @@ AudioStream LoadAudioStream(unsigned int sampleRate, unsigned int sampleSize, un
     return stream;
 }
 
+// Load an audio stream backed by a fixed-capacity, pre-allocated ring buffer
+AudioStream LoadAudioStreamRing(unsigned int sampleRate, unsigned int sampleSize, unsigned int channels, unsigned int capacityFrames)
+{
+    AudioStream stream = { 0 };
+
+    bool validSampleSize = (sampleSize == 8) || (sampleSize == 16) || (sampleSize == 32);
+    bool validCapacity = (capacityFrames > 0) && (channels > 0) && (channels <= MA_MAX_CHANNELS);
+
+    if (validSampleSize && validCapacity)
+    {
+        unsigned int frameSizeInBytes = channels*(sampleSize/8);
+        validCapacity = (capacityFrames <= (UINT_MAX/frameSizeInBytes));
+    }
+
+    if ((sampleRate == 0) || !validSampleSize || !validCapacity)
+    {
+        TRACELOG(LOG_WARNING, "STREAM: Invalid ring buffer parameters");
+        return stream;
+    }
+
+    stream.sampleRate = sampleRate;
+    stream.sampleSize = sampleSize;
+    stream.channels = channels;
+
+    ma_format formatIn = ((stream.sampleSize == 8)? ma_format_u8 : ((stream.sampleSize == 16)? ma_format_s16 : ma_format_f32));
+    stream.buffer = LoadAudioBuffer(formatIn, stream.channels, stream.sampleRate, capacityFrames, AUDIO_BUFFER_USAGE_RING);
+
+    if (stream.buffer != NULL)
+    {
+        stream.buffer->looping = false;
+        TRACELOG(LOG_INFO, "STREAM: Ring initialized successfully (%i Hz, %i bit, %s, %u frames)", stream.sampleRate, stream.sampleSize, (stream.channels == 1)? "Mono" : "Stereo", capacityFrames);
+    }
+    else TRACELOG(LOG_WARNING, "STREAM: Failed to create ring buffer");
+
+    return stream;
+}
+
 // Check if an audio stream is valid (buffers initialized)
 bool IsAudioStreamValid(AudioStream stream)
 {
@@ -2171,11 +2277,170 @@ bool IsAudioStreamProcessed(AudioStream stream)
     if (stream.buffer != NULL)
     {
         ma_mutex_lock(&AUDIO.System.lock);
-        result = stream.buffer->isSubBufferProcessed[0] || stream.buffer->isSubBufferProcessed[1];
+        if (stream.buffer->isRingBuffer) result = (stream.buffer->framesAvailable < stream.buffer->sizeInFrames);
+        else result = stream.buffer->isSubBufferProcessed[0] || stream.buffer->isSubBufferProcessed[1];
         ma_mutex_unlock(&AUDIO.System.lock);
     }
 
     return result;
+}
+
+// Queue PCM frames into a ring audio stream
+AudioStreamStatus WriteAudioStream(AudioStream stream, const void *data, int frameCount, int *framesWritten)
+{
+    AudioStreamStatus status = AUDIO_STREAM_STATUS_INVALID;
+    int written = 0;
+
+    if (stream.buffer != NULL)
+    {
+        ma_mutex_lock(&AUDIO.System.lock);
+        status = WriteAudioStreamInLockedState(stream, data, frameCount, &written);
+        ma_mutex_unlock(&AUDIO.System.lock);
+    }
+
+    if (framesWritten != NULL) *framesWritten = written;
+    return status;
+}
+
+// Read PCM frames from a ring audio stream
+AudioStreamStatus ReadAudioStream(AudioStream stream, void *data, int frameCount, int *framesRead)
+{
+    AudioStreamStatus status = AUDIO_STREAM_STATUS_INVALID;
+    int read = 0;
+
+    if (stream.buffer != NULL)
+    {
+        ma_mutex_lock(&AUDIO.System.lock);
+        status = ReadAudioStreamInLockedState(stream, data, frameCount, &read);
+        ma_mutex_unlock(&AUDIO.System.lock);
+    }
+
+    if (framesRead != NULL) *framesRead = read;
+    return status;
+}
+
+// Get current ring audio stream status
+AudioStreamStatus GetAudioStreamStatus(AudioStream stream)
+{
+    AudioStreamStatus status = AUDIO_STREAM_STATUS_INVALID;
+
+    if ((stream.buffer != NULL) && (stream.sampleRate > 0) && (stream.sampleSize > 0) && (stream.channels > 0))
+    {
+        ma_mutex_lock(&AUDIO.System.lock);
+        status = (stream.buffer->isRingBuffer && stream.buffer->underrun)? AUDIO_STREAM_STATUS_UNDERRUN : AUDIO_STREAM_STATUS_OK;
+        ma_mutex_unlock(&AUDIO.System.lock);
+    }
+
+    return status;
+}
+
+// Get ring audio stream capacity in PCM frames
+int GetAudioStreamCapacityFrames(AudioStream stream)
+{
+    int result = 0;
+
+    if (stream.buffer != NULL)
+    {
+        ma_mutex_lock(&AUDIO.System.lock);
+        if (stream.buffer->isRingBuffer) result = (int)stream.buffer->sizeInFrames;
+        ma_mutex_unlock(&AUDIO.System.lock);
+    }
+
+    return result;
+}
+
+// Get PCM frames currently queued in a ring audio stream
+int GetAudioStreamBufferedFrames(AudioStream stream)
+{
+    int result = 0;
+
+    if (stream.buffer != NULL)
+    {
+        ma_mutex_lock(&AUDIO.System.lock);
+        if (stream.buffer->isRingBuffer) result = (int)stream.buffer->framesAvailable;
+        ma_mutex_unlock(&AUDIO.System.lock);
+    }
+
+    return result;
+}
+
+// Get PCM frames available for writing to a ring audio stream
+int GetAudioStreamFreeFrames(AudioStream stream)
+{
+    int result = 0;
+
+    if (stream.buffer != NULL)
+    {
+        ma_mutex_lock(&AUDIO.System.lock);
+        if (stream.buffer->isRingBuffer) result = (int)(stream.buffer->sizeInFrames - stream.buffer->framesAvailable);
+        ma_mutex_unlock(&AUDIO.System.lock);
+    }
+
+    return result;
+}
+
+// Get number of contiguous underrun events since stream creation or last flush
+unsigned int GetAudioStreamUnderrunCount(AudioStream stream)
+{
+    unsigned int result = 0;
+
+    if (stream.buffer != NULL)
+    {
+        ma_mutex_lock(&AUDIO.System.lock);
+        if (stream.buffer->isRingBuffer) result = stream.buffer->underrunCount;
+        ma_mutex_unlock(&AUDIO.System.lock);
+    }
+
+    return result;
+}
+
+// Get memory owned by an audio stream, including its data converter
+unsigned int GetAudioStreamMemoryUsage(AudioStream stream)
+{
+    unsigned int result = 0;
+
+    if (stream.buffer != NULL)
+    {
+        ma_mutex_lock(&AUDIO.System.lock);
+
+        ma_uint32 frameSizeInBytes = ma_get_bytes_per_frame(stream.buffer->converter.formatIn, stream.buffer->converter.channelsIn);
+        size_t memoryUsage = sizeof(AudioBuffer) + stream.buffer->converterHeapSize +
+            ((size_t)stream.buffer->sizeInFrames*frameSizeInBytes) +
+            ((size_t)AUDIO_BUFFER_RESIDUAL_CAPACITY*frameSizeInBytes);
+
+        for (rAudioProcessor *processor = stream.buffer->processor; processor != NULL; processor = processor->next)
+        {
+            memoryUsage += sizeof(rAudioProcessor);
+        }
+
+        if (memoryUsage > UINT_MAX) memoryUsage = UINT_MAX;
+        result = (unsigned int)memoryUsage;
+
+        ma_mutex_unlock(&AUDIO.System.lock);
+    }
+
+    return result;
+}
+
+// Discard queued PCM frames and reset ring cursors
+void FlushAudioStream(AudioStream stream)
+{
+    if (stream.buffer != NULL)
+    {
+        ma_mutex_lock(&AUDIO.System.lock);
+
+        if (stream.buffer->isRingBuffer)
+        {
+            stream.buffer->frameCursorPos = 0;
+            stream.buffer->writeCursorPos = 0;
+            stream.buffer->framesAvailable = 0;
+            stream.buffer->framesProcessed = 0;
+            stream.buffer->underrun = false;
+            stream.buffer->underrunCount = 0;
+        }
+
+        ma_mutex_unlock(&AUDIO.System.lock);
+    }
 }
 
 // Play audio stream
@@ -2354,6 +2619,61 @@ static void OnLog(void *pUserData, ma_uint32 level, const char *pMessage)
     TRACELOG(LOG_WARNING, "miniaudio: %s", pMessage);   // All log messages from miniaudio are errors
 }
 
+// Read frames from a pre-allocated ring buffer, splitting the copy when it wraps
+static ma_uint32 ReadAudioRingBufferFrames(AudioBuffer *audioBuffer, void *framesOut, ma_uint32 frameCount)
+{
+    if ((audioBuffer == NULL) || !audioBuffer->isRingBuffer || (framesOut == NULL) || (frameCount == 0)) return 0;
+
+    ma_uint32 framesToRead = frameCount;
+    if (framesToRead > audioBuffer->framesAvailable) framesToRead = audioBuffer->framesAvailable;
+    if (framesToRead == 0) return 0;
+
+    ma_uint32 frameSizeInBytes = ma_get_bytes_per_frame(audioBuffer->converter.formatIn, audioBuffer->converter.channelsIn);
+    ma_uint32 framesUntilEnd = audioBuffer->sizeInFrames - audioBuffer->frameCursorPos;
+    ma_uint32 firstPartFrames = (framesToRead < framesUntilEnd)? framesToRead : framesUntilEnd;
+
+    memcpy(framesOut, audioBuffer->data + (audioBuffer->frameCursorPos*frameSizeInBytes), firstPartFrames*frameSizeInBytes);
+
+    if (framesToRead > firstPartFrames)
+    {
+        memcpy((unsigned char *)framesOut + (firstPartFrames*frameSizeInBytes), audioBuffer->data, (framesToRead - firstPartFrames)*frameSizeInBytes);
+    }
+
+    audioBuffer->frameCursorPos = (audioBuffer->frameCursorPos + framesToRead)%audioBuffer->sizeInFrames;
+    audioBuffer->framesAvailable -= framesToRead;
+    audioBuffer->framesProcessed += framesToRead;
+
+    return framesToRead;
+}
+
+// Write frames into a pre-allocated ring buffer, splitting the copy when it wraps
+static ma_uint32 WriteAudioRingBufferFrames(AudioBuffer *audioBuffer, const void *framesIn, ma_uint32 frameCount)
+{
+    if ((audioBuffer == NULL) || !audioBuffer->isRingBuffer || (framesIn == NULL) || (frameCount == 0)) return 0;
+
+    ma_uint32 freeFrameCount = audioBuffer->sizeInFrames - audioBuffer->framesAvailable;
+    ma_uint32 framesToWrite = frameCount;
+    if (framesToWrite > freeFrameCount) framesToWrite = freeFrameCount;
+    if (framesToWrite == 0) return 0;
+
+    ma_uint32 frameSizeInBytes = ma_get_bytes_per_frame(audioBuffer->converter.formatIn, audioBuffer->converter.channelsIn);
+    ma_uint32 framesUntilEnd = audioBuffer->sizeInFrames - audioBuffer->writeCursorPos;
+    ma_uint32 firstPartFrames = (framesToWrite < framesUntilEnd)? framesToWrite : framesUntilEnd;
+
+    memcpy(audioBuffer->data + (audioBuffer->writeCursorPos*frameSizeInBytes), framesIn, firstPartFrames*frameSizeInBytes);
+
+    if (framesToWrite > firstPartFrames)
+    {
+        memcpy(audioBuffer->data, (const unsigned char *)framesIn + (firstPartFrames*frameSizeInBytes), (framesToWrite - firstPartFrames)*frameSizeInBytes);
+    }
+
+    audioBuffer->writeCursorPos = (audioBuffer->writeCursorPos + framesToWrite)%audioBuffer->sizeInFrames;
+    audioBuffer->framesAvailable += framesToWrite;
+    audioBuffer->underrun = false;
+
+    return framesToWrite;
+}
+
 // Reads audio data from an AudioBuffer object in internal format
 static ma_uint32 ReadAudioBufferFramesInInternalFormat(AudioBuffer *audioBuffer, void *framesOut, ma_uint32 frameCount)
 {
@@ -2367,6 +2687,19 @@ static ma_uint32 ReadAudioBufferFramesInInternalFormat(AudioBuffer *audioBuffer,
         audioBuffer->framesProcessed += frameCount;
 
         return frameCount;
+    }
+
+    if (audioBuffer->isRingBuffer)
+    {
+        ma_uint32 framesRead = ReadAudioRingBufferFrames(audioBuffer, framesOut, frameCount);
+
+        if ((framesRead == 0) && (frameCount > 0) && !audioBuffer->underrun)
+        {
+            audioBuffer->underrun = true;
+            audioBuffer->underrunCount++;
+        }
+
+        return framesRead;
     }
 
     ma_uint32 subBufferSizeInFrames = (audioBuffer->sizeInFrames > 1)? audioBuffer->sizeInFrames/2 : audioBuffer->sizeInFrames;
@@ -2597,7 +2930,14 @@ static void OnSendAudioDataToDevice(ma_device *pDevice, void *pFramesOut, const 
                     // If all the frames requested can't be read, break
                     if (framesJustRead < framesToReadRightNow)
                     {
-                        if (!audioBuffer->looping)
+                        if (audioBuffer->isRingBuffer)
+                        {
+                            // A ring stream stays active when starved; the missing
+                            // frames are silence and playback resumes from the next
+                            // queued frame without rewinding the read cursor.
+                            break;
+                        }
+                        else if (!audioBuffer->looping)
                         {
                             StopAudioBufferInLockedState(audioBuffer);
                             break;
@@ -2687,7 +3027,17 @@ static void StopAudioBufferInLockedState(AudioBuffer *buffer)
 {
     if (buffer != NULL)
     {
-        if (IsAudioBufferPlayingInLockedState(buffer))
+        if (buffer->isRingBuffer)
+        {
+            buffer->playing = false;
+            buffer->paused = false;
+            buffer->frameCursorPos = 0;
+            buffer->writeCursorPos = 0;
+            buffer->framesAvailable = 0;
+            buffer->framesProcessed = 0;
+            buffer->underrun = false;
+        }
+        else if (IsAudioBufferPlayingInLockedState(buffer))
         {
             buffer->playing = false;
             buffer->paused = false;
@@ -2699,11 +3049,81 @@ static void StopAudioBufferInLockedState(AudioBuffer *buffer)
     }
 }
 
+// Write to an audio stream, assuming the audio system mutex has been locked
+static AudioStreamStatus WriteAudioStreamInLockedState(AudioStream stream, const void *data, int frameCount, int *framesWritten)
+{
+    if (framesWritten != NULL) *framesWritten = 0;
+
+    if ((stream.buffer == NULL) || !stream.buffer->isRingBuffer || (frameCount < 0) || ((data == NULL) && (frameCount > 0)))
+    {
+        return AUDIO_STREAM_STATUS_INVALID;
+    }
+
+    if (frameCount == 0) return AUDIO_STREAM_STATUS_OK;
+
+    ma_uint32 written = WriteAudioRingBufferFrames(stream.buffer, data, (ma_uint32)frameCount);
+    if (framesWritten != NULL) *framesWritten = (int)written;
+
+    if (written == (ma_uint32)frameCount) return AUDIO_STREAM_STATUS_OK;
+    if (written > 0) return AUDIO_STREAM_STATUS_PARTIAL;
+
+    return AUDIO_STREAM_STATUS_FULL;
+}
+
+// Read from an audio stream, assuming the audio system mutex has been locked
+static AudioStreamStatus ReadAudioStreamInLockedState(AudioStream stream, void *data, int frameCount, int *framesRead)
+{
+    if (framesRead != NULL) *framesRead = 0;
+
+    if ((stream.buffer == NULL) || !stream.buffer->isRingBuffer || (frameCount < 0) || ((data == NULL) && (frameCount > 0)))
+    {
+        return AUDIO_STREAM_STATUS_INVALID;
+    }
+
+    if (frameCount == 0) return AUDIO_STREAM_STATUS_OK;
+
+    ma_uint32 read = ReadAudioRingBufferFrames(stream.buffer, data, (ma_uint32)frameCount);
+    if (framesRead != NULL) *framesRead = (int)read;
+
+    if (read < (ma_uint32)frameCount)
+    {
+        ma_uint32 frameSizeInBytes = ma_get_bytes_per_frame(stream.buffer->converter.formatIn, stream.buffer->converter.channelsIn);
+        memset((unsigned char *)data + (read*frameSizeInBytes), 0, (frameCount - read)*frameSizeInBytes);
+
+        if (!stream.buffer->underrun)
+        {
+            stream.buffer->underrun = true;
+            stream.buffer->underrunCount++;
+        }
+
+        return AUDIO_STREAM_STATUS_UNDERRUN;
+    }
+
+    return AUDIO_STREAM_STATUS_OK;
+}
+
 // Update audio stream, assuming the audio system mutex has been locked
 static void UpdateAudioStreamInLockedState(AudioStream stream, const void *data, int frameCount)
 {
     if (stream.buffer != NULL)
     {
+        if (stream.buffer->isRingBuffer)
+        {
+            int framesWritten = 0;
+            AudioStreamStatus status = WriteAudioStreamInLockedState(stream, data, frameCount, &framesWritten);
+
+            if (status == AUDIO_STREAM_STATUS_FULL)
+            {
+                TRACELOG(LOG_WARNING, "STREAM: Ring buffer is full, %i frames dropped", frameCount);
+            }
+            else if (status == AUDIO_STREAM_STATUS_PARTIAL)
+            {
+                TRACELOG(LOG_WARNING, "STREAM: Ring buffer full, only %i of %i frames written", framesWritten, frameCount);
+            }
+
+            return;
+        }
+
         if (stream.buffer->isSubBufferProcessed[0] || stream.buffer->isSubBufferProcessed[1])
         {
             ma_uint32 subBufferToUpdate = 0;

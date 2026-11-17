@@ -1679,6 +1679,15 @@ RLAPI RayCollision GetRayCollisionQuad(Ray ray, Vector3 p1, Vector3 p2, Vector3 
 //------------------------------------------------------------------------------------
 typedef void (*AudioCallback)(void *bufferData, unsigned int frames);
 
+// Audio stream operation status
+typedef enum {
+    AUDIO_STREAM_STATUS_OK = 0,         // All requested frames were transferred
+    AUDIO_STREAM_STATUS_PARTIAL,        // Write accepted only part of the requested frames
+    AUDIO_STREAM_STATUS_FULL,           // Write rejected because the stream buffer is full
+    AUDIO_STREAM_STATUS_UNDERRUN,       // Read could not be fully satisfied
+    AUDIO_STREAM_STATUS_INVALID         // Invalid stream or arguments
+} AudioStreamStatus;
+
 // Audio device management functions
 RLAPI void InitAudioDevice(void);                                     // Initialize audio device and context
 RLAPI void CloseAudioDevice(void);                                    // Close the audio device and context
@@ -1736,10 +1745,20 @@ RLAPI float GetMusicTimePlayed(Music music);                          // Get cur
 
 // AudioStream management functions
 RLAPI AudioStream LoadAudioStream(unsigned int sampleRate, unsigned int sampleSize, unsigned int channels); // Load audio stream (to stream raw audio pcm data)
+RLAPI AudioStream LoadAudioStreamRing(unsigned int sampleRate, unsigned int sampleSize, unsigned int channels, unsigned int capacityFrames); // Load audio stream with pre-allocated ring buffer (fixed capacity in frames)
 RLAPI bool IsAudioStreamValid(AudioStream stream);                    // Check if an audio stream is valid (buffers initialized)
 RLAPI void UnloadAudioStream(AudioStream stream);                     // Unload audio stream and free memory
 RLAPI void UpdateAudioStream(AudioStream stream, const void *data, int frameCount); // Update audio stream buffers with data
 RLAPI bool IsAudioStreamProcessed(AudioStream stream);                // Check if any audio stream buffers requires refill
+RLAPI AudioStreamStatus WriteAudioStream(AudioStream stream, const void *data, int frameCount, int *framesWritten); // Queue PCM frames to a ring stream, returns explicit status
+RLAPI AudioStreamStatus ReadAudioStream(AudioStream stream, void *data, int frameCount, int *framesRead); // Read PCM frames from a ring stream, returns UNDERRUN when short
+RLAPI AudioStreamStatus GetAudioStreamStatus(AudioStream stream);     // Get current ring stream status
+RLAPI int GetAudioStreamCapacityFrames(AudioStream stream);           // Get ring stream capacity in PCM frames
+RLAPI int GetAudioStreamBufferedFrames(AudioStream stream);           // Get PCM frames currently queued in a ring stream
+RLAPI int GetAudioStreamFreeFrames(AudioStream stream);               // Get PCM frames available for writing to a ring stream
+RLAPI unsigned int GetAudioStreamUnderrunCount(AudioStream stream);   // Get number of contiguous underrun events since stream creation/flush
+RLAPI unsigned int GetAudioStreamMemoryUsage(AudioStream stream);     // Get memory owned by an audio stream (in bytes, including converter)
+RLAPI void FlushAudioStream(AudioStream stream);                      // Discard queued PCM frames and reset ring cursors
 RLAPI void PlayAudioStream(AudioStream stream);                       // Play audio stream
 RLAPI void PauseAudioStream(AudioStream stream);                      // Pause audio stream
 RLAPI void ResumeAudioStream(AudioStream stream);                     // Resume audio stream
