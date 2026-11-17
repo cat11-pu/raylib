@@ -662,6 +662,7 @@ TEXTURES = \
     textures/textures_raw_data \
     textures/textures_screen_buffer \
     textures/textures_sprite_animation \
+    textures/textures_sprite_batching \
     textures/textures_sprite_button \
     textures/textures_sprite_explosion \
     textures/textures_sprite_stacking \
