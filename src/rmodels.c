@@ -54,6 +54,7 @@
 #include <stdlib.h>         // Required for: malloc(), calloc(), free()
 #include <string.h>         // Required for: strlen(), memcmp()
 #include <math.h>           // Required for: sinf(), cosf(), sqrtf(), fabsf()
+#include <limits.h>         // Required for: INT_MAX
 
 #if SUPPORT_FILEFORMAT_OBJ || SUPPORT_FILEFORMAT_MTL
     #define TINYOBJ_MALLOC RL_MALLOC
@@ -1937,6 +1938,530 @@ void DrawMeshInstanced(Mesh mesh, Material material, const Matrix *transforms, i
     rlUnloadVertexBuffer(instancesVboId);
     RL_FREE(instanceTransform);
 #endif
+}
+
+//----------------------------------------------------------------------------------
+// Level-of-detail batch functions
+//----------------------------------------------------------------------------------
+
+struct LodBatch {
+    bool valid;
+
+    int levelCount;
+    LodLevel levels[RL_LOD_MAX_LEVELS];
+
+    LodInstance *instances;
+    int instanceCount;
+    int instanceCapacity;
+
+    int *instanceLevels;
+    float *instanceErrors;
+    float *instanceScales;
+    int *baseLevels;
+
+    int *instanceGroups;
+    int groupCount;
+    int groupCapacity;
+    int *groupIds;
+    int *groupLevels;
+    int *groupBaseLevels;
+    float *groupErrors;
+
+    Matrix *sortedTransforms;
+    LodDraw draws[RL_LOD_MAX_LEVELS];
+    int drawCount;
+
+    int switchCount;
+    int seamLockedCount;
+    int levelCounts[RL_LOD_MAX_LEVELS];
+    float maxScreenError;
+    float screenErrorBudget;
+};
+
+// Check that all matrix components are finite
+static bool IsLodMatrixFinite(Matrix mat)
+{
+    return isfinite(mat.m0) && isfinite(mat.m1) && isfinite(mat.m2) && isfinite(mat.m3) &&
+           isfinite(mat.m4) && isfinite(mat.m5) && isfinite(mat.m6) && isfinite(mat.m7) &&
+           isfinite(mat.m8) && isfinite(mat.m9) && isfinite(mat.m10) && isfinite(mat.m11) &&
+           isfinite(mat.m12) && isfinite(mat.m13) && isfinite(mat.m14) && isfinite(mat.m15);
+}
+
+// Get the maximum axis scale of an affine TRS matrix
+static float GetLodMaxScale(Matrix mat)
+{
+    float sx = mat.m0*mat.m0 + mat.m1*mat.m1 + mat.m2*mat.m2;
+    float sy = mat.m4*mat.m4 + mat.m5*mat.m5 + mat.m6*mat.m6;
+    float sz = mat.m8*mat.m8 + mat.m9*mat.m9 + mat.m10*mat.m10;
+
+    return sqrtf(fmaxf(fmaxf(sx, sy), sz));
+}
+
+// Get perspective/orthographic pixels per world unit at a given distance
+static float GetLodPixelsPerUnit(Camera camera, int viewportHeight, float distance)
+{
+    if (camera.projection == CAMERA_PERSPECTIVE)
+    {
+        float halfFov = camera.fovy*DEG2RAD*0.5f;
+        return (float)viewportHeight/(2.0f*distance*tanf(halfFov));
+    }
+
+    return (float)viewportHeight/camera.fovy;
+}
+
+// Grow instance storage while preserving contents
+static bool GrowLodInstanceCapacity(LodBatch *batch, int capacity)
+{
+    if (capacity <= batch->instanceCapacity) return true;
+
+    int newCapacity = (batch->instanceCapacity > 0)? batch->instanceCapacity : 32;
+
+    while (newCapacity < capacity)
+    {
+        if (newCapacity > INT_MAX/2)
+        {
+            newCapacity = capacity;
+            break;
+        }
+
+        newCapacity *= 2;
+    }
+
+    batch->instances = (LodInstance *)RL_REALLOC(batch->instances, newCapacity*sizeof(LodInstance));
+    batch->instanceLevels = (int *)RL_REALLOC(batch->instanceLevels, newCapacity*sizeof(int));
+    batch->instanceErrors = (float *)RL_REALLOC(batch->instanceErrors, newCapacity*sizeof(float));
+    batch->instanceScales = (float *)RL_REALLOC(batch->instanceScales, newCapacity*sizeof(float));
+    batch->baseLevels = (int *)RL_REALLOC(batch->baseLevels, newCapacity*sizeof(int));
+    batch->instanceGroups = (int *)RL_REALLOC(batch->instanceGroups, newCapacity*sizeof(int));
+    batch->sortedTransforms = (Matrix *)RL_REALLOC(batch->sortedTransforms, newCapacity*sizeof(Matrix));
+
+    if ((batch->instances == NULL) || (batch->instanceLevels == NULL) ||
+        (batch->instanceErrors == NULL) || (batch->instanceScales == NULL) ||
+        (batch->baseLevels == NULL) || (batch->instanceGroups == NULL) ||
+        (batch->sortedTransforms == NULL)) return false;
+
+    batch->instanceCapacity = newCapacity;
+
+    return true;
+}
+
+// Grow seam group storage while preserving contents
+static bool GrowLodGroupCapacity(LodBatch *batch, int capacity)
+{
+    if (capacity <= batch->groupCapacity) return true;
+
+    int newCapacity = (batch->groupCapacity > 0)? batch->groupCapacity : 16;
+
+    while (newCapacity < capacity)
+    {
+        if (newCapacity > INT_MAX/2)
+        {
+            newCapacity = capacity;
+            break;
+        }
+
+        newCapacity *= 2;
+    }
+
+    batch->groupIds = (int *)RL_REALLOC(batch->groupIds, newCapacity*sizeof(int));
+    batch->groupLevels = (int *)RL_REALLOC(batch->groupLevels, newCapacity*sizeof(int));
+    batch->groupBaseLevels = (int *)RL_REALLOC(batch->groupBaseLevels, newCapacity*sizeof(int));
+    batch->groupErrors = (float *)RL_REALLOC(batch->groupErrors, newCapacity*sizeof(float));
+
+    if ((batch->groupIds == NULL) || (batch->groupLevels == NULL) ||
+        (batch->groupBaseLevels == NULL) || (batch->groupErrors == NULL)) return false;
+
+    batch->groupCapacity = newCapacity;
+
+    return true;
+}
+
+// Get a seam group slot, creating it when required
+static int GetLodGroupSlot(LodBatch *batch, int seamGroup)
+{
+    for (int i = 0; i < batch->groupCount; i++)
+    {
+        if (batch->groupIds[i] == seamGroup) return i;
+    }
+
+    int slot = batch->groupCount;
+    batch->groupIds[slot] = seamGroup;
+    batch->groupLevels[slot] = -1;
+    batch->groupBaseLevels[slot] = -1;
+    batch->groupErrors[slot] = 0.0f;
+    batch->groupCount++;
+
+    return slot;
+}
+
+// Create an instance LOD batch, meshes/materials remain caller-owned
+LodBatch *CreateLodBatch(const LodLevel *levels, int levelCount)
+{
+    if ((levels == NULL) || (levelCount <= 0) || (levelCount > RL_LOD_MAX_LEVELS)) return NULL;
+
+    for (int i = 0; i < levelCount; i++)
+    {
+        if (!isfinite(levels[i].geometricError) || (levels[i].geometricError < 0.0f)) return NULL;
+        if ((i > 0) && (levels[i].geometricError < levels[i - 1].geometricError)) return NULL;
+    }
+
+    LodBatch *batch = (LodBatch *)RL_CALLOC(1, sizeof(LodBatch));
+    if (batch == NULL) return NULL;
+
+    batch->levelCount = levelCount;
+    for (int i = 0; i < levelCount; i++) batch->levels[i] = levels[i];
+
+    batch->valid = true;
+
+    return batch;
+}
+
+// Unload LOD batch CPU storage
+void UnloadLodBatch(LodBatch *batch)
+{
+    if (batch == NULL) return;
+
+    batch->valid = false;
+
+    RL_FREE(batch->instances);
+    RL_FREE(batch->instanceLevels);
+    RL_FREE(batch->instanceErrors);
+    RL_FREE(batch->instanceScales);
+    RL_FREE(batch->baseLevels);
+    RL_FREE(batch->instanceGroups);
+    RL_FREE(batch->groupIds);
+    RL_FREE(batch->groupLevels);
+    RL_FREE(batch->groupBaseLevels);
+    RL_FREE(batch->groupErrors);
+    RL_FREE(batch->sortedTransforms);
+    RL_FREE(batch);
+}
+
+// Check if LOD batch is valid
+bool IsLodBatchValid(const LodBatch *batch)
+{
+    return (batch != NULL) && batch->valid;
+}
+
+// Append instances to an LOD batch
+bool SubmitLodInstances(LodBatch *batch, const LodInstance *instances, int instanceCount)
+{
+    if (!IsLodBatchValid(batch) || (instances == NULL) || (instanceCount <= 0)) return false;
+    if (instanceCount > (INT_MAX - batch->instanceCount)) return false;
+
+    for (int i = 0; i < instanceCount; i++)
+    {
+        if (!IsLodMatrixFinite(instances[i].transform)) return false;
+        if (!isfinite(instances[i].boundsCenter.x) ||
+            !isfinite(instances[i].boundsCenter.y) ||
+            !isfinite(instances[i].boundsCenter.z)) return false;
+        if (!isfinite(instances[i].boundsRadius) || (instances[i].boundsRadius < 0.0f)) return false;
+        if (instances[i].seamGroup < 0) return false;
+    }
+
+    int newCount = batch->instanceCount + instanceCount;
+
+    if (!GrowLodInstanceCapacity(batch, newCount)) return false;
+
+    // NOTE: Worst case every submitted instance belongs to a different seam group
+    if (!GrowLodGroupCapacity(batch, newCount)) return false;
+
+    for (int i = 0; i < instanceCount; i++)
+    {
+        int index = batch->instanceCount + i;
+        int group = (instances[i].seamGroup > 0)? GetLodGroupSlot(batch, instances[i].seamGroup) : -1;
+
+        batch->instances[index] = instances[i];
+        batch->instanceLevels[index] = -1;
+        batch->instanceErrors[index] = 0.0f;
+        batch->instanceScales[index] = GetLodMaxScale(instances[i].transform);
+        batch->baseLevels[index] = -1;
+        batch->instanceGroups[index] = group;
+    }
+
+    batch->instanceCount = newCount;
+    batch->drawCount = 0;
+    batch->seamLockedCount = 0;
+    batch->maxScreenError = 0.0f;
+
+    for (int i = 0; i < RL_LOD_MAX_LEVELS; i++) batch->levelCounts[i] = 0;
+
+    return true;
+}
+
+// Update one instance world transform
+bool SetLodInstanceTransform(LodBatch *batch, int instanceIndex, Matrix transform)
+{
+    if (!IsLodBatchValid(batch) || (instanceIndex < 0) || (instanceIndex >= batch->instanceCount)) return false;
+    if (!IsLodMatrixFinite(transform)) return false;
+
+    batch->instances[instanceIndex].transform = transform;
+    batch->instanceScales[instanceIndex] = GetLodMaxScale(transform);
+
+    return true;
+}
+
+// Remove all instances while retaining capacity
+void ClearLodInstances(LodBatch *batch)
+{
+    if (!IsLodBatchValid(batch)) return;
+
+    batch->instanceCount = 0;
+    batch->groupCount = 0;
+    batch->drawCount = 0;
+    batch->seamLockedCount = 0;
+    batch->maxScreenError = 0.0f;
+
+    for (int i = 0; i < RL_LOD_MAX_LEVELS; i++) batch->levelCounts[i] = 0;
+}
+
+// Select LODs and build draw groups
+bool UpdateLodBatch(LodBatch *batch, Camera camera, int viewportHeight, float screenErrorBudget, float hysteresis)
+{
+    if (!IsLodBatchValid(batch)) return false;
+    if ((viewportHeight <= 0) || !isfinite(screenErrorBudget) || (screenErrorBudget <= 0.0f)) return false;
+    if (!isfinite(hysteresis) || (hysteresis < 0.0f) || (hysteresis >= 1.0f)) return false;
+    if (!isfinite(camera.fovy) || (camera.fovy <= 0.0f)) return false;
+    if (!isfinite(camera.position.x) || !isfinite(camera.position.y) || !isfinite(camera.position.z)) return false;
+    if (!isfinite(camera.target.x) || !isfinite(camera.target.y) || !isfinite(camera.target.z)) return false;
+
+    Vector3 cameraForward = { 0 };
+    if (camera.projection == CAMERA_PERSPECTIVE)
+    {
+        if (camera.fovy >= 180.0f) return false;
+
+        cameraForward = Vector3Subtract(camera.target, camera.position);
+        float forwardLength = Vector3Length(cameraForward);
+
+        if (!isfinite(forwardLength) || (forwardLength < 0.000001f)) return false;
+
+        cameraForward = Vector3Scale(cameraForward, 1.0f/forwardLength);
+    }
+    else if (camera.projection != CAMERA_ORTHOGRAPHIC) return false;
+
+    batch->screenErrorBudget = screenErrorBudget;
+    batch->seamLockedCount = 0;
+
+    for (int i = 0; i < RL_LOD_MAX_LEVELS; i++) batch->levelCounts[i] = 0;
+
+    if (batch->instanceCount == 0)
+    {
+        batch->drawCount = 0;
+        batch->maxScreenError = 0.0f;
+        return true;
+    }
+
+    float coarseLimit = screenErrorBudget*(1.0f - hysteresis);
+
+    // Compute independent level requests and the pixel scale of each instance
+    for (int i = 0; i < batch->instanceCount; i++)
+    {
+        float maxScale = batch->instanceScales[i];
+        Vector3 worldCenter = Vector3Transform(batch->instances[i].boundsCenter, batch->instances[i].transform);
+        float depth = 0.0f;
+
+        if (camera.projection == CAMERA_PERSPECTIVE)
+        {
+            depth = Vector3DotProduct(Vector3Subtract(worldCenter, camera.position), cameraForward) -
+                    batch->instances[i].boundsRadius*maxScale;
+
+            if (!isfinite(depth) || (depth < 0.0001f)) depth = 0.0001f;
+        }
+
+        float pixelScale = 2.0f*GetLodPixelsPerUnit(camera, viewportHeight, depth)*maxScale;
+
+        batch->instanceErrors[i] = pixelScale;
+        batch->baseLevels[i] = 0;
+
+        for (int level = 1; level < batch->levelCount; level++)
+        {
+            float levelError = batch->levels[level].geometricError*pixelScale;
+
+            if (levelError <= screenErrorBudget) batch->baseLevels[i] = level;
+            else break;
+        }
+    }
+
+    // Find the finest requested level for every seam group
+    for (int i = 0; i < batch->groupCount; i++) batch->groupBaseLevels[i] = INT_MAX;
+
+    for (int i = 0; i < batch->instanceCount; i++)
+    {
+        int group = batch->instanceGroups[i];
+
+        if ((group >= 0) && (batch->baseLevels[i] < batch->groupBaseLevels[group]))
+        {
+            batch->groupBaseLevels[group] = batch->baseLevels[i];
+        }
+    }
+
+    // Compute the largest switch error bound inside every seam group
+    for (int i = 0; i < batch->groupCount; i++) batch->groupErrors[i] = 0.0f;
+
+    for (int i = 0; i < batch->instanceCount; i++)
+    {
+        int group = batch->instanceGroups[i];
+        if (group < 0) continue;
+
+        float levelError = batch->levels[batch->groupBaseLevels[group]].geometricError*batch->instanceErrors[i];
+
+        if (levelError > batch->groupErrors[group]) batch->groupErrors[group] = levelError;
+    }
+
+    // Apply hysteresis and assign the final level
+    for (int i = 0; i < batch->instanceCount; i++)
+    {
+        int group = batch->instanceGroups[i];
+        int current = batch->instanceLevels[i];
+        int assigned = 0;
+
+        if (group >= 0)
+        {
+            int requested = batch->groupBaseLevels[group];
+            int groupCurrent = batch->groupLevels[group];
+
+            if ((groupCurrent < 0) ||
+                ((requested > groupCurrent) && (batch->groupErrors[group] <= coarseLimit)) ||
+                (requested < groupCurrent))
+            {
+                groupCurrent = requested;
+                batch->groupLevels[group] = groupCurrent;
+            }
+
+            assigned = groupCurrent;
+            if (assigned != batch->baseLevels[i]) batch->seamLockedCount++;
+        }
+        else
+        {
+            int requested = batch->baseLevels[i];
+            float requestedError = batch->levels[requested].geometricError*batch->instanceErrors[i];
+
+            if ((current < 0) || (requested < current) ||
+                ((requested > current) && (requestedError <= coarseLimit)))
+            {
+                current = requested;
+            }
+
+            assigned = current;
+        }
+
+        if ((batch->instanceLevels[i] >= 0) && (batch->instanceLevels[i] != assigned)) batch->switchCount++;
+
+        batch->instanceLevels[i] = assigned;
+        batch->instanceErrors[i] = batch->levels[assigned].geometricError*batch->instanceErrors[i];
+        batch->levelCounts[assigned]++;
+    }
+
+    // Build one contiguous transform array per active level
+    int levelOffsets[RL_LOD_MAX_LEVELS] = { 0 };
+    int levelCursors[RL_LOD_MAX_LEVELS] = { 0 };
+    int transformCount = 0;
+
+    for (int level = 0; level < batch->levelCount; level++)
+    {
+        levelOffsets[level] = transformCount;
+        levelCursors[level] = transformCount;
+        transformCount += batch->levelCounts[level];
+    }
+
+    for (int i = 0; i < batch->instanceCount; i++)
+    {
+        int level = batch->instanceLevels[i];
+        batch->sortedTransforms[levelCursors[level]] = batch->instances[i].transform;
+        levelCursors[level]++;
+    }
+
+    batch->drawCount = 0;
+    batch->maxScreenError = 0.0f;
+
+    for (int level = 0; level < batch->levelCount; level++)
+    {
+        if (batch->levelCounts[level] <= 0) continue;
+
+        batch->draws[batch->drawCount].level = level;
+        batch->draws[batch->drawCount].instanceCount = batch->levelCounts[level];
+        batch->draws[batch->drawCount].transforms = batch->sortedTransforms + levelOffsets[level];
+        batch->drawCount++;
+    }
+
+    for (int i = 0; i < batch->instanceCount; i++)
+    {
+        if (batch->instanceErrors[i] > batch->maxScreenError) batch->maxScreenError = batch->instanceErrors[i];
+    }
+
+    return true;
+}
+
+// Draw LOD groups with instancing
+void DrawLodBatch(const LodBatch *batch)
+{
+    if (!IsLodBatchValid(batch)) return;
+
+    for (int i = 0; i < batch->drawCount; i++)
+    {
+        const LodDraw *draw = &batch->draws[i];
+        DrawMeshInstanced(batch->levels[draw->level].mesh, batch->levels[draw->level].material, draw->transforms, draw->instanceCount);
+    }
+}
+
+// Get LOD update statistics
+LodStats GetLodBatchStats(const LodBatch *batch)
+{
+    LodStats stats = { 0 };
+
+    if (!IsLodBatchValid(batch)) return stats;
+
+    stats.instanceCount = batch->instanceCount;
+    stats.drawCount = batch->drawCount;
+    stats.switchCount = batch->switchCount;
+    stats.seamLockedCount = batch->seamLockedCount;
+    stats.maxScreenError = batch->maxScreenError;
+    stats.screenErrorBudget = batch->screenErrorBudget;
+
+    for (int i = 0; i < RL_LOD_MAX_LEVELS; i++) stats.levelCounts[i] = batch->levelCounts[i];
+
+    stats.allocatedBytes = (unsigned int)sizeof(LodBatch);
+    stats.allocatedBytes += (unsigned int)(batch->instanceCapacity*sizeof(LodInstance));
+    stats.allocatedBytes += (unsigned int)(batch->instanceCapacity*sizeof(int)*2);
+    stats.allocatedBytes += (unsigned int)(batch->instanceCapacity*sizeof(float)*2);
+    stats.allocatedBytes += (unsigned int)(batch->instanceCapacity*sizeof(Matrix));
+    stats.allocatedBytes += (unsigned int)(batch->instanceCapacity*sizeof(int));
+    stats.allocatedBytes += (unsigned int)(batch->groupCapacity*sizeof(int)*3);
+    stats.allocatedBytes += (unsigned int)(batch->groupCapacity*sizeof(float));
+
+    return stats;
+}
+
+// Copy active draw groups, returns total count
+int GetLodBatchDraws(const LodBatch *batch, LodDraw *draws, int maxDraws)
+{
+    if (!IsLodBatchValid(batch)) return 0;
+
+    if ((draws != NULL) && (maxDraws > 0))
+    {
+        int count = (maxDraws < batch->drawCount)? maxDraws : batch->drawCount;
+
+        for (int i = 0; i < count; i++) draws[i] = batch->draws[i];
+    }
+
+    return batch->drawCount;
+}
+
+// Get active level of an instance
+int GetLodInstanceLevel(const LodBatch *batch, int instanceIndex)
+{
+    if (!IsLodBatchValid(batch) || (instanceIndex < 0) || (instanceIndex >= batch->instanceCount)) return -1;
+
+    return batch->instanceLevels[instanceIndex];
+}
+
+// Get switch error bound of an instance in pixels
+float GetLodInstanceScreenError(const LodBatch *batch, int instanceIndex)
+{
+    if (!IsLodBatchValid(batch) || (instanceIndex < 0) || (instanceIndex >= batch->instanceCount)) return -1.0f;
+    if (batch->instanceLevels[instanceIndex] < 0) return -1.0f;
+
+    return batch->instanceErrors[instanceIndex];
 }
 
 // Unload mesh from memory (RAM and VRAM)

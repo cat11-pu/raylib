@@ -441,6 +441,45 @@ typedef struct ModelAnimation {
     ModelAnimPose *keyframePoses; // Animation sequence keyframe poses [keyframe][pose]
 } ModelAnimation;
 
+// Level-of-detail level, mesh and material are not owned by the batch
+#define RL_LOD_MAX_LEVELS 8
+
+typedef struct LodLevel {
+    Mesh mesh;              // Mesh rendered for this detail level (not owned)
+    Material material;      // Material used for this detail level (not owned)
+    float geometricError;   // Absolute geometric error from the reference mesh, in local units
+} LodLevel;
+
+// Level-of-detail instance
+typedef struct LodInstance {
+    Matrix transform;       // World transform
+    Vector3 boundsCenter;   // Bounding-sphere center in local space
+    float boundsRadius;     // Bounding-sphere radius before transform scaling
+    int seamGroup;          // Seam lock group, 0 means independent
+} LodInstance;
+
+// Level-of-detail draw group
+typedef struct LodDraw {
+    int level;              // Detail level index
+    int instanceCount;      // Number of transforms in this group
+    const Matrix *transforms; // Transforms valid until next submit/update/unload
+} LodDraw;
+
+// Level-of-detail update statistics
+typedef struct LodStats {
+    int instanceCount;      // Submitted instances
+    int drawCount;          // Active draw groups
+    int switchCount;        // Accumulated level switches since batch creation
+    int seamLockedCount;    // Instances forced to a shared seam level in last update
+    int levelCounts[RL_LOD_MAX_LEVELS]; // Instances per active level
+    float maxScreenError;   // Worst-case switch error bound in pixels, last update
+    float screenErrorBudget; // Pixel budget used by last update
+    unsigned int allocatedBytes; // CPU memory owned by the batch
+} LodStats;
+
+// Level-of-detail batch, opaque
+typedef struct LodBatch LodBatch;
+
 // Ray, ray for raycasting
 typedef struct Ray {
     Vector3 position;       // Ray position (origin)
@@ -1631,6 +1670,18 @@ RLAPI void UpdateMeshBuffer(Mesh mesh, int index, const void *data, int dataSize
 RLAPI void UnloadMesh(Mesh mesh);                                                           // Unload mesh data from CPU and GPU
 RLAPI void DrawMesh(Mesh mesh, Material material, Matrix transform);                        // Draw a 3d mesh with material and transform
 RLAPI void DrawMeshInstanced(Mesh mesh, Material material, const Matrix *transforms, int instances); // Draw multiple mesh instances with material and different transforms
+RLAPI LodBatch *CreateLodBatch(const LodLevel *levels, int levelCount);                     // Create an instance LOD batch, meshes/materials remain caller-owned
+RLAPI void UnloadLodBatch(LodBatch *batch);                                                 // Unload LOD batch CPU storage
+RLAPI bool IsLodBatchValid(const LodBatch *batch);                                          // Check if LOD batch is valid
+RLAPI bool SubmitLodInstances(LodBatch *batch, const LodInstance *instances, int instanceCount); // Append instances to an LOD batch
+RLAPI bool SetLodInstanceTransform(LodBatch *batch, int instanceIndex, Matrix transform);   // Update one instance world transform
+RLAPI void ClearLodInstances(LodBatch *batch);                                              // Remove all instances while retaining capacity
+RLAPI bool UpdateLodBatch(LodBatch *batch, Camera camera, int viewportHeight, float screenErrorBudget, float hysteresis); // Select LODs and build draw groups
+RLAPI void DrawLodBatch(const LodBatch *batch);                                             // Draw LOD groups with instancing
+RLAPI LodStats GetLodBatchStats(const LodBatch *batch);                                      // Get LOD update statistics
+RLAPI int GetLodBatchDraws(const LodBatch *batch, LodDraw *draws, int maxDraws);            // Copy active draw groups, returns total count
+RLAPI int GetLodInstanceLevel(const LodBatch *batch, int instanceIndex);                    // Get active level of an instance
+RLAPI float GetLodInstanceScreenError(const LodBatch *batch, int instanceIndex);            // Get switch error bound of an instance in pixels
 RLAPI BoundingBox GetMeshBoundingBox(Mesh mesh);                                            // Compute mesh bounding box limits
 RLAPI void GenMeshTangents(Mesh *mesh);                                                     // Compute mesh tangents
 RLAPI bool ExportMesh(Mesh mesh, const char *fileName);                                     // Export mesh data to file, returns true on success

@@ -51,6 +51,8 @@ packages/
 *.o
 *.exe
 *.a
+tests/test_lod
+tests/test_lod_asan
 *.bc
 *.so
 *.so.*
