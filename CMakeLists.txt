@@ -55,3 +55,8 @@ if (${BUILD_EXAMPLES})
 endif()
 
 enable_testing()
+
+if (${BUILD_TESTS})
+  message(STATUS "Building tests is enabled")
+  add_subdirectory(tests)
+endif()
